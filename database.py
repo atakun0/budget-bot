@@ -50,6 +50,10 @@ async def init_db():
             await db.execute("ALTER TABLE receipts ADD COLUMN category TEXT")
         except Exception:
             pass
+        try:  # [NEW] категория у каждого товара из чека
+            await db.execute("ALTER TABLE receipt_items ADD COLUMN category TEXT")  # [NEW]
+        except Exception:  # [NEW]
+            pass  # [NEW]
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS receipt_members (
@@ -64,7 +68,16 @@ async def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             receipt_id INTEGER,
             name TEXT,
-            price REAL
+            price REAL,
+            category TEXT
+        )
+        """)
+
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS receipt_item_members (
+            item_id INTEGER,
+            user_id INTEGER,
+            PRIMARY KEY (item_id, user_id)
         )
         """)
 
@@ -159,25 +172,50 @@ async def get_receipts(chat_id: int):
 async def get_receipt_items(receipt_id: int):
     async with aiosqlite.connect(DB_NAME) as db:
         cursor = await db.execute("""
-            SELECT name, price
+            SELECT name, price, category
             FROM receipt_items
             WHERE receipt_id = ?
             ORDER BY id ASC
-        """, (receipt_id,))
+        """, (receipt_id,))  # [CHG] отдаём категорию товара для карточки чека
         return await cursor.fetchall()
 
 
 async def get_my_receipts(chat_id: int, user_id: int):
+    """Возвращает последние покупки, созданные пользователем.
 
+    В таблице receipts хранятся и чеки, и покупки, добавленные вручную,
+    поэтому ручной ввод автоматически попадает в личную историю.
+    """
     async with aiosqlite.connect(DB_NAME) as db:
-
         cursor = await db.execute("""
-            SELECT id, created_at
+            SELECT id, created_at, store, total, payer_id,
+                   CASE
+                       WHEN image_path IS NULL THEN 'manual'
+                       ELSE 'receipt'
+                   END AS source
             FROM receipts
             WHERE chat_id = ?
               AND user_id = ?
-            ORDER BY created_at DESC
-            LIMIT 10
+              AND processed = 1
+            ORDER BY datetime(created_at) DESC, id DESC
+            LIMIT 20
+        """, (chat_id, user_id))
+
+        return await cursor.fetchall()
+
+
+async def get_my_debts(chat_id: int, user_id: int):
+    """Возвращает непогашенные долги, где пользователь является должником."""
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute("""
+            SELECT d.id, d.to_user, d.amount, d.receipt_id, r.created_at, r.store
+            FROM debts d
+            LEFT JOIN receipts r ON r.id = d.receipt_id
+            WHERE d.chat_id = ?
+              AND d.from_user = ?
+              AND d.is_paid = 0
+              AND d.amount > 0
+            ORDER BY datetime(r.created_at) DESC, d.id DESC
         """, (chat_id, user_id))
 
         return await cursor.fetchall()
@@ -242,15 +280,23 @@ async def get_receipt_participants(receipt_id: int):
         return await cursor.fetchall()
 
 
-async def add_item(receipt_id: int, name: str, price: float):
+async def add_item(receipt_id: int, name: str, price: float, category: str | None = None):
     async with aiosqlite.connect(DB_NAME) as db:
-
-        await db.execute("""
+        cursor = await db.execute("""
         INSERT INTO receipt_items
-        (receipt_id,name,price)
-        VALUES(?,?,?)
-        """,(receipt_id,name,price))
+        (receipt_id,name,price,category)
+        VALUES(?,?,?,?)
+        """, (receipt_id, name, price, category))
+        await db.commit()
+        return cursor.lastrowid
 
+
+async def link_member_to_item(item_id: int, user_id: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("""
+            INSERT OR IGNORE INTO receipt_item_members (item_id, user_id)
+            VALUES (?, ?)
+        """, (item_id, user_id))
         await db.commit()
 
 
@@ -323,3 +369,93 @@ async def clear_members(chat_id: int):
             (chat_id,)
         )
         await db.commit()
+
+
+# [NEW] Удаляет чеки и товары группы, долги не трогает
+async def clear_expenses(chat_id: int):
+    async with aiosqlite.connect(DB_NAME) as db:  # [NEW]
+        await db.execute(
+            """
+            DELETE FROM receipt_item_members
+            WHERE item_id IN (
+                SELECT ri.id FROM receipt_items ri
+                JOIN receipts r ON r.id = ri.receipt_id
+                WHERE r.chat_id = ?
+            )
+            """,
+            (chat_id,),
+        )
+        await db.execute(  # [NEW] сначала товары, чтобы не оставить «осиротевшие» позиции
+            """
+            DELETE FROM receipt_items
+            WHERE receipt_id IN (
+                SELECT id FROM receipts WHERE chat_id = ?
+            )
+            """,
+            (chat_id,),
+        )
+        await db.execute(  # [NEW] кто участвовал в каких чеках
+            """
+            DELETE FROM receipt_members
+            WHERE receipt_id IN (
+                SELECT id FROM receipts WHERE chat_id = ?
+            )
+            """,
+            (chat_id,),
+        )
+        await db.execute(  # [NEW] сами чеки и ручные покупки
+            """
+            DELETE FROM receipts
+            WHERE chat_id = ?
+            """,
+            (chat_id,),
+        )
+        await db.commit()  # [NEW]
+
+
+# [CHG] Суммы по категориям за последние 7 дней: ручные покупки + чеки
+async def get_category_totals_last_week(chat_id: int):
+    # [CHG] Открываем соединение с базой
+    async with aiosqlite.connect(DB_NAME) as db:
+        # [CHG] Переписан SQL-запрос: теперь он объединяет категории товаров и общие категории покупок без позиций
+        cursor = await db.execute(
+            """
+            SELECT category_name, SUM(amount) AS amount
+            FROM (
+                -- ЧАСТЬ 1: Собираем категории из отдельных товаров чеков (для распознанных фото-чеков)
+                SELECT
+                    COALESCE(NULLIF(TRIM(ri.category), ''), NULLIF(TRIM(r.category), ''), 'Без категории') AS category_name,
+                    ri.price AS amount
+                FROM receipt_items ri
+                JOIN receipts r ON r.id = ri.receipt_id
+                WHERE r.chat_id = ?
+                  AND r.processed = 1
+                  AND ri.price IS NOT NULL
+                  AND ri.price > 0
+                  AND datetime(r.created_at) >= datetime('now', '-7 days')
+
+                UNION ALL
+
+                -- ЧАСТЬ 2 [FIX]: Собираем категории напрямую из чеков/покупок (для ручного ввода, где нет позиций товаров)
+                SELECT
+                    COALESCE(NULLIF(TRIM(r.category), ''), 'Без категории') AS category_name,
+                    r.total AS amount
+                FROM receipts r
+                WHERE r.chat_id = ?
+                  AND r.processed = 1
+                  AND r.total IS NOT NULL
+                  AND r.total > 0
+                  AND datetime(r.created_at) >= datetime('now', '-7 days')
+                  -- [FIX] Важное условие: берем запись из receipts, ТОЛЬКО если для неё нет записей в receipt_items
+                  -- Это исключает двойной учет суммы (и за чек целиком, и за его товары отдельно)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM receipt_items ri WHERE ri.receipt_id = r.id
+                  )
+            ) AS cat_rows
+            GROUP BY category_name
+            ORDER BY amount DESC
+            """,
+            (chat_id, chat_id),  # [CHG] Передаем chat_id дважды: первый для ЧАСТИ 1, второй для ЧАСТИ 2
+        )
+        # [CHG] Возвращаем список кортежей (название категории, сумма) в функцию построения графика
+        return await cursor.fetchall()
