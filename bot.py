@@ -1,8 +1,15 @@
 import asyncio
 import os
+from io import BytesIO  # [NEW] картинка диаграммы в памяти, без сохранения на диск
 from pathlib import Path
 
-from aiogram import Bot, Dispatcher
+import matplotlib  # [NEW] библиотека для круговой диаграммы
+
+matplotlib.use("Agg")  # [NEW] режим без окна — бот рисует график в фоне
+import matplotlib.pyplot as plt  # [NEW] построение pie-chart
+from matplotlib import font_manager  # [NEW] шрифт с кириллицей для подписей
+
+from aiogram import Bot, Dispatcher, F  # [CHG] F — фильтр «только фото» для загрузки чека
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message,
@@ -10,6 +17,7 @@ from aiogram.types import (
     BotCommand,
     ReplyKeyboardMarkup,
     KeyboardButton,
+    BufferedInputFile,  # [NEW] отправка PNG диаграммы в Telegram
 )
 
 from aiogram.types import (
@@ -56,6 +64,8 @@ from database import (
     get_receipt_items,
     get_receipt_participants,
     set_receipt_payer,
+    get_category_totals_last_week,  # [CHG] суммы по категориям за последнюю неделю
+    clear_expenses,  # [NEW] удаление чеков, товаров и связанных долгов группы
 )
 
 
@@ -76,7 +86,10 @@ dp = Dispatcher()
 # =========================================================
 
 class ReceiptState(StatesGroup):
+    waiting_receipt_photo = State()  # [NEW] ждём фото только после кнопки «Загрузить чек»
     choosing_members = State()
+    receipt_category = State()  # [NEW] выбор категории после распознавания чека
+    receipt_category_custom = State()  # [NEW] своя категория для чека
     waiting_confirmation = State()
     manual_amount = State()
     manual_category = State()
@@ -116,10 +129,14 @@ def main_keyboard():
             ],
             [
                 KeyboardButton(text="🧾 Мои чеки"),
+                KeyboardButton(text="📊 Категории"),  # [NEW] кнопка круговой диаграммы расходов
             ],
             [
                 KeyboardButton(text="🧹 Очистить долги"),
                 KeyboardButton(text="🗑 Очистить участников"),
+            ],
+            [
+                KeyboardButton(text="🧾 Очистить список трат"),  # [NEW] широкая кнопка: одна на весь нижний ряд
             ],
         ],
         resize_keyboard=True,
@@ -158,6 +175,10 @@ async def setup_bot_commands():
         BotCommand(
             command="clear_debts",
             description="🧹 Очистить долги"
+        ),
+        BotCommand(  # [NEW] команда меню Telegram для диаграммы категорий
+            command="categories",
+            description="📊 Расходы по категориям"
         ),
     ]
 
@@ -280,6 +301,14 @@ MANUAL_CATEGORIES = [
 ]
 
 
+def purchase_categories_keyboard(callback_prefix: str):  # [NEW] один список категорий для ручного ввода и для чека
+    builder = InlineKeyboardBuilder()  # [NEW]
+    for category in MANUAL_CATEGORIES:  # [NEW]
+        builder.button(text=category, callback_data=f"{callback_prefix}:{category}")  # [NEW]
+    builder.adjust(2)  # [NEW]
+    return builder.as_markup()  # [NEW]
+
+
 @dp.message(lambda message: message.text == "✍️ Добавить покупку")
 async def manual_purchase_start(message: Message, state: FSMContext):
     if message.chat.type == "private":
@@ -322,15 +351,10 @@ async def manual_amount(message: Message, state: FSMContext):
         return
 
     await state.update_data(manual_amount=round(amount, 2))
-    builder = InlineKeyboardBuilder()
-    for category in MANUAL_CATEGORIES:
-        builder.button(text=category, callback_data=f"manual_cat:{category}")
-    builder.adjust(2)
-
-    await state.set_state(ReceiptState.manual_category)
-    await message.answer(
-        "🏷 Выберите категорию покупки:",
-        reply_markup=builder.as_markup()
+    await state.set_state(ReceiptState.manual_category)  # [CHG] категория через общую клавиатуру
+    await message.answer(  # [CHG]
+        "🏷 Выберите категорию покупки:",  # [CHG]
+        reply_markup=purchase_categories_keyboard("manual_cat")  # [CHG] тот же список, что на скриншоте
     )
 
 
@@ -359,7 +383,11 @@ async def manual_custom_category(message: Message, state: FSMContext):
         await message.answer("❌ Категория должна содержать от 1 до 50 символов.")
         return
 
-    await state.update_data(manual_category=category)
+    # [FIX] Принудительно капитализируем первую букву (например: "аптека" -> "Аптека"), 
+    # чтобы на графике не плодились одинаковые категории с разным регистром
+    category = category.capitalize() 
+
+    await state.update_data(manual_category=category) # [CHG] Сохраняем обработанную строку
     await show_manual_payer(message, state)
 
 
@@ -563,12 +591,13 @@ async def manual_cancel(callback: CallbackQuery, state: FSMContext):
 # ПОЛУЧЕНИЕ ФОТО ЧЕКА
 # =========================================================
 
-@dp.message(lambda message: message.photo is not None)
+@dp.message(ReceiptState.waiting_receipt_photo, F.photo)  # [CHG] фото чека принимаем только после кнопки
 async def receive_receipt(
     message: Message,
     state: FSMContext
 ):
     if message.chat.type == "private":
+        await state.clear()  # [NEW] сбрасываем ожидание, если вдруг нажали в личке
         await message.answer(
             "📸 Отправляй чек в группу."
         )
@@ -612,6 +641,7 @@ async def receive_receipt(
     )
 
     if not members:
+        await state.clear()  # [NEW] не оставляем режим ожидания чека
         await message.answer(
             "❌ В группе пока нет участников.\n\n"
             "Сначала нажмите «➕ Присоединиться»."
@@ -654,12 +684,36 @@ async def receive_receipt(
 # =========================================================
 
 @dp.message(lambda message: message.text == "📸 Загрузить чек")
-async def upload_receipt_button(message: Message):
-    await message.answer(
-        "📸 Просто отправьте фотографию чека "
-        "прямо в этот чат.\n\n"
-        "После этого я распознаю его и попрошу "
-        "выбрать участников покупки."
+async def upload_receipt_button(message: Message, state: FSMContext):  # [CHG] включаем режим ожидания фото
+    if message.chat.type == "private":  # [NEW]
+        await message.answer(  # [NEW]
+            "❌ Эту функцию нужно использовать в группе."  # [NEW]
+        )
+        return  # [NEW]
+
+    members = await get_members(message.chat.id)  # [NEW]
+    if not members:  # [NEW]
+        await message.answer(  # [NEW]
+            "❌ В группе пока нет участников.\n\n"
+            "Сначала нажмите «➕ Присоединиться»."
+        )
+        return  # [NEW]
+
+    await state.set_state(ReceiptState.waiting_receipt_photo)  # [NEW] дальше ждём только фото чека
+    await message.answer(  # [CHG]
+        "📸 Отправьте фотографию чека в этот чат.\n\n"
+        "Другие файлы не подойдут. Если пришлёте не фото — "
+        "я напомню один раз, и загрузку нужно будет начать заново."
+    )
+
+
+@dp.message(ReceiptState.waiting_receipt_photo)  # [NEW] любое сообщение после кнопки, если это не фото
+async def receipt_wait_not_photo(message: Message, state: FSMContext):  # [NEW]
+    await state.clear()  # [NEW] выключаем ожидание: чтобы добавить чек, кнопку жмут снова
+    await message.answer(  # [NEW]
+        "❌ Пожалуйста, отправьте фото чека.\n\n"
+        "Нажмите «📸 Загрузить чек», "
+        "чтобы попробовать снова."
     )
 
 
@@ -851,40 +905,93 @@ async def finish_receipt(
         selected=selected,
         receipt_id=receipt_id,
         receipt_data=receipt_data,
-        payer=callback.from_user.id
+        payer=callback.from_user.id,
+        items_text=items_text,  # [NEW] текст товаров для экрана подтверждения после выбора категории
+        names_text=names_text,  # [NEW]
+        share=share,  # [NEW]
+        store=store,  # [NEW]
+        total=total,  # [NEW]
     )
 
-    builder = InlineKeyboardBuilder()
+    await state.set_state(ReceiptState.receipt_category)  # [NEW] сначала категория, потом подтверждение
+    await callback.message.edit_text(  # [NEW]
+        "🏷 Выберите категорию покупки:\n\n"  # [NEW]
+        "Все товары из этого чека будут записаны в выбранную категорию "  # [NEW]
+        "и попадут на круговую диаграмму.",  # [NEW]
+        reply_markup=purchase_categories_keyboard("receipt_cat"),  # [NEW] тот же список, что у ручной покупки
+    )  # [NEW]
 
-    builder.button(
-        text="✅ Подтвердить",
-        callback_data=f"confirm_{receipt_id}"
-    )
+    await callback.answer()
 
-    builder.button(
-        text="❌ Отменить",
-        callback_data=f"cancel_{receipt_id}"
-    )
 
-    builder.adjust(1)
+# =========================================================
+# [NEW] КАТЕГОРИЯ ДЛЯ ЧЕКА — ТОТ ЖЕ СПИСОК, ЧТО У РУЧНОЙ ПОКУПКИ
+# =========================================================
 
-    await callback.message.edit_text(
+async def send_receipt_confirmation(message: Message, state: FSMContext, *, edit: bool):  # [NEW] экран проверки чека после выбора категории
+    data = await state.get_data()  # [NEW]
+    receipt_id = data["receipt_id"]  # [NEW]
+    store = data.get("store", "Неизвестный магазин")  # [NEW]
+    items_text = data.get("items_text", "")  # [NEW]
+    total = float(data.get("total", 0))  # [NEW]
+    names_text = data.get("names_text", "")  # [NEW]
+    share = float(data.get("share", 0))  # [NEW]
+    category = data.get("receipt_category", "Прочее")  # [NEW]
+
+    builder = InlineKeyboardBuilder()  # [NEW]
+    builder.button(text="✅ Подтвердить", callback_data=f"confirm_{receipt_id}")  # [NEW]
+    builder.button(text="❌ Отменить", callback_data=f"cancel_{receipt_id}")  # [NEW]
+    builder.adjust(1)  # [NEW]
+
+    text = (  # [NEW]
         f"🧾 Проверьте данные чека:\n\n"
-        f"🏪 {store}\n\n"
+        f"🏪 {store}\n"
+        f"🏷 Категория: {category}\n\n"
         f"{items_text}\n"
         f"💰 Итого: {total:.2f} ₽\n\n"
         f"👥 Участники: {names_text}\n\n"
         f"💳 Доля каждого: {share:.2f} ₽\n\n"
         f"Если всё правильно — нажмите "
-        f"«Подтвердить».",
-        reply_markup=builder.as_markup()
+        f"«Подтвердить»."
     )
 
-    await state.set_state(
-        ReceiptState.waiting_confirmation
-    )
+    await state.set_state(ReceiptState.waiting_confirmation)  # [NEW]
+    if edit:  # [NEW]
+        await message.edit_text(text, reply_markup=builder.as_markup())  # [NEW]
+    else:  # [NEW]
+        await message.answer(text, reply_markup=builder.as_markup())  # [NEW]
 
-    await callback.answer()
+
+@dp.callback_query(ReceiptState.receipt_category, lambda c: c.data.startswith("receipt_cat:"))  # [NEW]
+async def receipt_category(callback: CallbackQuery, state: FSMContext):  # [NEW]
+    category = callback.data.split(":", 1)[1]  # [NEW]
+
+    if category == "✏️ Своя категория":  # [NEW]
+        await state.set_state(ReceiptState.receipt_category_custom)  # [NEW]
+        await callback.message.edit_text(  # [NEW]
+            "✏️ Введите свою категорию одним сообщением.\n"
+            "Например: «Дом», «Аптека» или «Питомцы»."
+        )
+        await callback.answer()  # [NEW]
+        return  # [NEW]
+
+    await state.update_data(receipt_category=category)  # [NEW] все товары чека попадут в эту категорию
+    await send_receipt_confirmation(callback.message, state, edit=True)  # [NEW]
+    await callback.answer()  # [NEW]
+
+
+@dp.message(ReceiptState.receipt_category_custom)  # [NEW]
+async def receipt_custom_category(message: Message, state: FSMContext):  # [NEW]
+    category = (message.text or "").strip()  # [NEW]
+    if not category or len(category) > 50:  # [NEW]
+        await message.answer("❌ Категория должна содержать от 1 до 50 символов.")  # [NEW]
+        return  # [NEW]
+
+    # [FIX] Также капитализируем кастомную категорию для фото-чеков для одинакового отображения
+    category = category.capitalize()
+
+    await state.update_data(receipt_category=category)  # [NEW]
+    await send_receipt_confirmation(message, state, edit=False)  # [NEW]
 
 
 # =========================================================
@@ -960,16 +1067,20 @@ async def confirm_receipt(
         await add_item(
             receipt_id,
             name,
-            price
+            price,
+            data.get("receipt_category", "Прочее"),  # [NEW] товар чека пишется в выбранную категорию
         )
 
     # Запоминаем пользователя, который подтвердил оплату чека.
     await set_receipt_payer(receipt_id, payer)
 
+    category = data.get("receipt_category", "Прочее")  # [NEW] категория всего чека для диаграммы
+
     await update_receipt_total(
         receipt_id,
         total,
-        store
+        store,
+        category,  # [CHG] раньше чек сохранялся без категории
     )
 
     debts_created = 0
@@ -1005,6 +1116,7 @@ async def confirm_receipt(
     await callback.message.edit_text(
         f"✅ Покупка подтверждена!\n\n"
         f"🏪 {store}\n"
+        f"🏷 Категория: {category}\n"  # [NEW]
         f"💰 Сумма: {total:.2f} ₽\n"
         f"👥 Участников: {len(selected)}\n"
         f"💳 Доля: {share:.2f} ₽\n\n"
@@ -1196,8 +1308,14 @@ async def receipt_details(callback: CallbackQuery):
     lines.append("🛒 Товары:")
 
     if items:
-        for name, price in items:
-            lines.append(f"• {name} — {float(price):.2f} ₽")
+        for item in items:
+            name = item[0]  # [CHG] название товара
+            price = item[1]  # [CHG]
+            item_category = item[2] if len(item) > 2 else None  # [NEW] категория позиции
+            if item_category:  # [NEW]
+                lines.append(f"• {name} — {float(price):.2f} ₽ ({item_category})")  # [NEW]
+            else:  # [NEW]
+                lines.append(f"• {name} — {float(price):.2f} ₽")
     else:
         lines.append("• Нет распознанных товаров.")
 
@@ -1339,6 +1457,210 @@ async def debts_button(message: Message):
 
 
 # =========================================================
+# [NEW] КРУГОВАЯ ДИАГРАММА РАСХОДОВ ПО КАТЕГОРИЯМ
+# =========================================================
+
+def _first_existing_font(paths):  # [NEW] берём первый найденный файл шрифта
+    for path in paths:  # [NEW]
+        if os.path.exists(path):  # [NEW]
+            return font_manager.FontProperties(fname=path)  # [NEW]
+    return font_manager.FontProperties()  # [NEW]
+
+
+def _cyrillic_fonts():  # [CHG] обычный и жирный шрифт для заголовков и подписей
+    regular = _first_existing_font([  # [CHG]
+        r"C:\Windows\Fonts\segoeui.ttf",
+        r"C:\Windows\Fonts\calibri.ttf",
+        r"C:\Windows\Fonts\arial.ttf",
+        r"C:\Windows\Fonts\tahoma.ttf",
+    ])
+    bold = _first_existing_font([  # [NEW] жирный вариант для заголовка и суммы
+        r"C:\Windows\Fonts\segoeuib.ttf",
+        r"C:\Windows\Fonts\calibrib.ttf",
+        r"C:\Windows\Fonts\arialbd.ttf",
+        r"C:\Windows\Fonts\tahomabd.ttf",
+    ])
+    return regular, bold  # [NEW]
+
+
+def build_category_pie_chart(rows):  # [CHG] вертикальная картинка: на телефоне текст не сжимается
+    labels = [str(row[0]) for row in rows]  # [NEW] названия категорий
+    values = [float(row[1]) for row in rows]  # [NEW] суммы по категориям
+    total = sum(values)  # [NEW] итог в центре кольца
+    font, font_bold = _cyrillic_fonts()  # [CHG]
+
+    bg = "#F6F3EE"  # [NEW] тёплый фон вместо резкого белого
+    ink = "#1F2A37"  # [NEW] цвет заголовков
+    muted = "#5C6B7A"  # [NEW] цвет второстепенного текста
+    palette = [  # [CHG] спокойная палитра, без кислотных цветов tab20
+        "#5B8DEF",
+        "#3DBE9A",
+        "#F3B23C",
+        "#7B6CFF",
+        "#F07A5A",
+        "#4AA8D8",
+        "#C26BD4",
+        "#6B8F71",
+        "#E08AB0",
+        "#8A9BB5",
+    ]
+    colors = [palette[i % len(palette)] for i in range(len(values))]  # [CHG]
+
+    legend_rows = max(len(values), 3)  # [NEW] высота картинки растёт вместе с легендой
+    fig_h = 9.2 + legend_rows * 0.55  # [NEW]
+    fig, ax = plt.subplots(figsize=(8.2, fig_h), facecolor=bg)  # [CHG] узкий портрет — крупнее на экране телефона
+    ax.set_facecolor(bg)  # [NEW]
+
+    def slice_label(pct):  # [NEW] мелкие сектора не подписываем, чтобы не наслаивался текст
+        return f"{pct:.0f}%" if pct >= 8 else ""  # [CHG] порог чуть выше: крупные цифры читаются лучше
+
+    wedges, _, autotexts = ax.pie(  # [CHG] кольцо с зазорами между секторами
+        values,
+        autopct=slice_label,
+        startangle=90,
+        pctdistance=0.78,
+        colors=colors,
+        radius=1.18,  # [NEW] круг крупнее относительно холста
+        wedgeprops={
+            "width": 0.50,
+            "edgecolor": bg,
+            "linewidth": 4.0,
+            "antialiased": True,
+        },
+    )
+
+    for autotext in autotexts:  # [CHG] проценты крупно, чтобы читались после сжатия Telegram
+        autotext.set_fontproperties(font_bold)
+        autotext.set_fontsize(25)
+        autotext.set_color("#FFFFFF")
+
+    ax.text(  # [NEW] подпись в центре кольца
+        0,
+        0.14,
+        "Итого",
+        ha="center",
+        va="center",
+        fontproperties=font,
+        fontsize=22,
+        color=muted,
+    )
+    ax.text(  # [NEW] сумма в центре
+        0,
+        -0.14,
+        f"{total:,.0f} ₽".replace(",", " "),
+        ha="center",
+        va="center",
+        fontproperties=font_bold,
+        fontsize=28,
+        color=ink,
+    )
+
+    ax.set_title("")  # [CHG] заголовок рисуем сами, чтобы разделить жирный и обычный текст
+    ax.text(  # [CHG]
+        0.5,
+        1.28,
+        "Расходы по категориям",
+        transform=ax.transAxes,
+        fontproperties=font_bold,
+        fontsize=30,
+        color=ink,
+        ha="center",
+        va="bottom",
+    )
+    ax.text(  # [NEW]
+        0.5,
+        1.14,
+        "за последние 7 дней",
+        transform=ax.transAxes,
+        fontproperties=font,
+        fontsize=24,
+        color=muted,
+        ha="center",
+        va="bottom",
+    )
+
+    legend_labels = [  # [CHG] одна строка крупным шрифтом — удобнее на телефоне
+        f"  {label}   {value:,.0f} ₽   {value / total * 100:.0f}%".replace(",", " ")
+        for label, value in zip(labels, values)
+    ]
+    legend = ax.legend(  # [CHG] легенда под кругом, а не сбоку — не мельчает на узком экране
+        wedges,
+        legend_labels,
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.08),
+        frameon=False,
+        handlelength=1.4,
+        handleheight=1.4,
+        markerscale=1.6,
+        borderaxespad=0.0,
+        labelspacing=1.15,
+        fontsize=22,
+    )
+    for text in legend.get_texts():  # [NEW] подписи легенды крупнее и темнее
+        text.set_fontproperties(font)
+        text.set_fontsize(22)
+        text.set_color(ink)
+        text.set_va("center")
+
+    ax.set_aspect("equal")  # [NEW] круг без сжатия
+    fig.subplots_adjust(left=0.06, right=0.94, top=0.78, bottom=0.22)  # [CHG] запас сверху и снизу под крупный текст
+
+    buffer = BytesIO()  # [NEW] сохраняем картинку в память
+    fig.savefig(  # [CHG] высокий dpi: Telegram сожмёт картинку, буквы останутся чёткими
+        buffer,
+        format="png",
+        dpi=180,
+        facecolor=bg,
+        bbox_inches="tight",
+        pad_inches=0.45,
+    )
+    plt.close(fig)  # [NEW] освобождаем память matplotlib
+    buffer.seek(0)  # [NEW] курсор в начало буфера перед отправкой
+    return buffer.getvalue()  # [NEW] байты готовой картинки
+
+
+@dp.message(Command("categories"))  # [NEW] команда /categories — как /debts и /receipts
+async def show_category_chart(message: Message):
+    if message.chat.type == "private":  # [NEW] статистика группы доступна только в группе
+        await message.answer(
+            "❌ Эту команду нужно использовать в группе."
+        )
+        return
+
+    rows = await get_category_totals_last_week(message.chat.id)  # [CHG] данные за последние 7 дней
+
+    if not rows:  # [NEW] нет подтверждённых покупок с суммой
+        await message.answer(
+            "📊 За последнюю неделю ещё нет расходов по категориям.\n\n"  # [CHG]
+            "Добавьте покупку кнопкой «✍️ Добавить покупку» "
+            "или подтвердите чек и выберите категорию."  # [CHG]
+        )
+        return
+
+    total = sum(float(amount) for _, amount in rows)  # [NEW] общая сумма для подписи
+    lines = ["📊 Расходы по категориям за 7 дней:\n"]  # [CHG] текстовая расшифровка рядом с графиком
+    for category, amount in rows:
+        share = (float(amount) / total) * 100 if total else 0
+        lines.append(f"• {category}: {float(amount):.2f} ₽ ({share:.1f}%)")
+    lines.append(f"\n💰 Итого: {total:.2f} ₽")
+
+    caption = "\n".join(lines)  # [NEW] текстовая расшифровка долей бюджета
+    photo_bytes = build_category_pie_chart(rows)  # [NEW] строим круговую диаграмму
+    photo = BufferedInputFile(photo_bytes, filename="categories.png")  # [NEW] файл для Telegram
+
+    if len(caption) > 1000:  # [NEW] если подпись не влезает, шлём график и текст отдельно
+        await message.answer_photo(photo=photo, caption="📊 Расходы по категориям за 7 дней")  # [CHG]
+        await message.answer(caption)
+    else:
+        await message.answer_photo(photo=photo, caption=caption)  # [NEW] график + расшифровка одним сообщением
+
+
+@dp.message(lambda message: message.text == "📊 Категории")  # [NEW] кнопка панели, как у «Все долги»
+async def categories_button(message: Message):
+    await show_category_chart(message)  # [NEW] та же логика, что у slash-команды
+
+
+# =========================================================
 # /clear_debts
 # =========================================================
 
@@ -1448,6 +1770,64 @@ async def clear_members_button(
         reply_markup=builder.as_markup(),
         parse_mode="HTML"
     )
+
+
+# =========================================================
+# [NEW] КНОПКА "ОЧИСТИТЬ СПИСОК ТРАТ"
+# =========================================================
+
+@dp.message(lambda message: message.text == "🧾 Очистить список трат")  # [NEW]
+async def clear_expenses_button(message: Message):  # [NEW]
+    if message.chat.type == "private":  # [NEW] как у остальных кнопок очистки
+        await message.answer(  # [NEW]
+            "❌ Эту функцию нужно использовать в группе."  # [NEW]
+        )
+        return  # [NEW]
+
+    builder = InlineKeyboardBuilder()  # [NEW] подтверждение, как у «Очистить участников»
+
+    builder.button(  # [NEW]
+        text="🗑 Да, очистить",  # [NEW]
+        callback_data="confirm_clear_expenses"  # [NEW]
+    )
+
+    builder.button(  # [NEW]
+        text="❌ Отмена",  # [NEW]
+        callback_data="cancel_clear_expenses"  # [NEW]
+    )
+
+    builder.adjust(1)  # [NEW]
+
+    await message.answer(  # [NEW]
+        "⚠️ <b>Очистить список трат?</b>\n\n"  # [NEW]
+        "Будут удалены все чеки и ручные покупки этой группы.\n\n"  # [CHG] долги больше не удаляем
+        "Долги и участники группы останутся.\n\n"  # [CHG]
+        "Это действие нельзя отменить.",  # [NEW]
+        reply_markup=builder.as_markup(),  # [NEW]
+        parse_mode="HTML"  # [NEW]
+    )
+
+
+@dp.callback_query(lambda c: c.data == "confirm_clear_expenses")  # [NEW]
+async def confirm_clear_expenses(callback: CallbackQuery):  # [NEW]
+    await clear_expenses(callback.message.chat.id)  # [NEW]
+
+    await callback.message.edit_text(  # [NEW]
+        "🧾 Список трат очищен.\n\n"  # [NEW]
+        "Чеки и покупки этой группы удалены."  # [CHG]
+    )
+
+    await callback.answer("Траты удалены")  # [NEW]
+
+
+@dp.callback_query(lambda c: c.data == "cancel_clear_expenses")  # [NEW]
+async def cancel_clear_expenses(callback: CallbackQuery):  # [NEW]
+    await callback.message.edit_text(  # [NEW]
+        "❌ Очистка списка трат отменена."  # [NEW]
+    )
+
+    await callback.answer("Отменено")  # [NEW]
+
 
 # =========================================================
 # ЗАПУСК
