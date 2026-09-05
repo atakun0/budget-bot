@@ -53,12 +53,15 @@ from database import (
     clear_debts,
     clear_members,
     get_my_receipts,
+    get_receipt_items,
+    get_receipt_participants,
+    set_receipt_payer,
 )
 
 
 
 load_dotenv()
-
+ 
 TOKEN = os.getenv("BOT_TOKEN")
 
 if not TOKEN:
@@ -658,6 +661,9 @@ async def confirm_receipt(
             price
         )
 
+    # Запоминаем пользователя, который подтвердил оплату чека.
+    await set_receipt_payer(receipt_id, payer)
+
     await update_receipt_total(
         receipt_id,
         total,
@@ -771,32 +777,167 @@ async def cancel_clear_members(
 # /receipts
 # =========================================================
 
+def receipts_list_kb(data):
+    builder = InlineKeyboardBuilder()
+    for receipt_id, _, created_at, *_ in data:
+        builder.button(
+            text=f"🧾 {created_at}",
+            callback_data=f"receipt:{receipt_id}",
+        )
+    builder.adjust(1)
+    return builder.as_markup()
+
+
 @dp.message(Command("receipts"))
 async def receipts(message: Message):
-    data = await get_receipts(
-        message.chat.id
-    )
+    data = await get_receipts(message.chat.id)
 
     if not data:
-        await message.answer(
-            "Пока нет сохранённых чеков."
-        )
+        await message.answer("Пока нет сохранённых чеков.")
         return
 
-    text = "🧾 Последние чеки:\n\n"
+    members = await get_members(message.chat.id)
+    names = {
+        uid: (first_name or (f"@{username}" if username else str(uid)))
+        for uid, username, first_name in members
+    }
 
-    for i, (_, date) in enumerate(
-        data,
-        start=1
-    ):
-        text += f"{i}. {date}\n"
+    builder = InlineKeyboardBuilder()
 
-    await message.answer(text)
+    for receipt in data:
+        (
+            receipt_id,
+            _,
+            created_at,
+            user_id,
+            username,
+            first_name,
+            store,
+            total,
+            payer_id,
+        ) = receipt
+
+        buyer_name = names.get(
+            payer_id,
+            first_name or (f"@{username}" if username else str(user_id))
+        )
+
+        builder.button(
+            text=f"🧾 {created_at} — 👤 {buyer_name}",
+            callback_data=f"receipt:{receipt_id}",
+        )
+
+    builder.adjust(1)
+
+    await message.answer(
+        "🧾 Все чеки:\n\n"
+        "Нажмите на чек, чтобы открыть полную информацию:",
+        reply_markup=builder.as_markup(),
+    )
+
 
 @dp.message(lambda message: message.text == "🧾 Все чеки")
 async def all_receipts_button(message: Message):
     await receipts(message)
 
+
+@dp.callback_query(lambda c: c.data.startswith("receipt:"))
+async def receipt_details(callback: CallbackQuery):
+    receipt_id = int(callback.data.split(":", 1)[1])
+
+    data = await get_receipts(callback.message.chat.id)
+    receipt = next((r for r in data if r[0] == receipt_id), None)
+
+    if not receipt:
+        await callback.answer("Чек не найден.", show_alert=True)
+        return
+
+    (
+        _,
+        image_path,
+        created_at,
+        user_id,
+        username,
+        first_name,
+        store,
+        total,
+        payer_id,
+    ) = receipt
+
+    members = await get_members(callback.message.chat.id)
+    names = {
+        uid: (first_name or (f"@{username}" if username else str(uid)))
+        for uid, username, first_name in members
+    }
+
+    buyer_name = names.get(
+        payer_id,
+        first_name or (f"@{username}" if username else str(user_id))
+    )
+
+    items = await get_receipt_items(receipt_id)
+    participants = await get_receipt_participants(receipt_id)
+
+    lines = [
+        f"🧾 Чек #{receipt_id}",
+        f"📅 Дата: {created_at}",
+        f"👤 Кто купил: {buyer_name}",
+    ]
+
+    if store:
+        lines.append(f"🏪 Магазин: {store}")
+
+    total_value = float(total or 0)
+    lines.append(f"💰 Итого: {total_value:.2f} ₽")
+
+    lines.append("")
+    lines.append("🛒 Товары:")
+
+    if items:
+        for name, price in items:
+            lines.append(f"• {name} — {float(price):.2f} ₽")
+    else:
+        lines.append("• Нет распознанных товаров.")
+
+    lines.append("")
+    lines.append("💸 Кто сколько должен:")
+
+    if participants and total_value > 0:
+        base_share = round(total_value / len(participants), 2)
+        running = 0.0
+
+        for index, (uid, username, participant_first_name) in enumerate(participants):
+            name = participant_first_name or (
+                f"@{username}" if username else str(uid)
+            )
+
+            # Последнему участнику отдаём остаток от округления.
+            if index == len(participants) - 1:
+                amount = round(total_value - running, 2)
+            else:
+                amount = base_share
+
+            running += amount
+
+            if payer_id and uid == payer_id:
+                lines.append(f"• {name} — 0 ₽ (оплатил чек)")
+            else:
+                lines.append(f"• {name} — {amount:.2f} ₽")
+
+    elif participants:
+        for uid, username, participant_first_name in participants:
+            name = participant_first_name or (
+                f"@{username}" if username else str(uid)
+            )
+            lines.append(f"• {name} — сумма не определена")
+    else:
+        lines.append("• Участники не указаны.")
+
+    # Фото чека при просмотре списка чеков не читаем и не отправляем.
+    # Показываем только сохранённые данные: товары, цены и расчёт долгов.
+    await callback.message.answer("\n".join(lines))
+
+    await callback.answer()
 
 # =========================================================
 # КНОПКА "МОИ ЧЕКИ"
@@ -822,12 +963,21 @@ async def my_receipts_button(message: Message):
         )
         return
 
-    text = "🧾 Ваши последние чеки:\n\n"
+    builder = InlineKeyboardBuilder()
 
-    for i, (_, date) in enumerate(data, start=1):
-        text += f"{i}. {date}\n"
+    for receipt_id, date in data:
+        builder.button(
+            text=f"🧾 {date}",
+            callback_data=f"receipt:{receipt_id}",
+        )
 
-    await message.answer(text)
+    builder.adjust(1)
+
+    await message.answer(
+        "🧾 Ваши последние чеки:\n\n"
+        "Нажмите на чек, чтобы открыть товары, цены и расчёт долгов:",
+        reply_markup=builder.as_markup(),
+    )
 
 
 # =========================================================
