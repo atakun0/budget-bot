@@ -35,9 +35,21 @@ async def init_db():
                 store TEXT,
                 total REAL,
                 processed INTEGER DEFAULT 0,
+                payer_id INTEGER,
+                category TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
+        # Миграции для уже существующей базы.
+        try:
+            await db.execute("ALTER TABLE receipts ADD COLUMN payer_id INTEGER")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE receipts ADD COLUMN category TEXT")
+        except Exception:
+            pass
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS receipt_members (
@@ -129,25 +141,38 @@ async def add_receipt(chat_id, user_id, file_id, image_path):
         await db.commit()
 
 async def get_receipts(chat_id: int):
-
     async with aiosqlite.connect(DB_NAME) as db:
-
         cursor = await db.execute("""
-            SELECT image_path, created_at
-            FROM receipts
-            WHERE chat_id = ?
-            ORDER BY created_at DESC
+            SELECT r.id, r.image_path, r.created_at,
+                   r.user_id, m.username, m.first_name,
+                   r.store, r.total, r.payer_id
+            FROM receipts r
+            LEFT JOIN members m
+              ON m.chat_id = r.chat_id AND m.user_id = r.user_id
+            WHERE r.chat_id = ?
+            ORDER BY r.created_at DESC
             LIMIT 10
         """, (chat_id,))
-
         return await cursor.fetchall()
+
+
+async def get_receipt_items(receipt_id: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute("""
+            SELECT name, price
+            FROM receipt_items
+            WHERE receipt_id = ?
+            ORDER BY id ASC
+        """, (receipt_id,))
+        return await cursor.fetchall()
+
 
 async def get_my_receipts(chat_id: int, user_id: int):
 
     async with aiosqlite.connect(DB_NAME) as db:
 
         cursor = await db.execute("""
-            SELECT image_path, created_at
+            SELECT id, created_at
             FROM receipts
             WHERE chat_id = ?
               AND user_id = ?
@@ -192,6 +217,31 @@ async def get_receipt_path(receipt_id: int):
 
         return row[0]
 
+async def set_receipt_payer(receipt_id: int, payer_id: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("""
+            UPDATE receipts
+            SET payer_id = ?
+            WHERE id = ?
+        """, (payer_id, receipt_id))
+        await db.commit()
+
+
+async def get_receipt_participants(receipt_id: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute("""
+            SELECT m.user_id, m.username, m.first_name
+            FROM receipt_members rm
+            JOIN members m ON m.user_id = rm.user_id
+            JOIN receipts r
+              ON r.id = rm.receipt_id
+             AND m.chat_id = r.chat_id
+            WHERE rm.receipt_id = ?
+            ORDER BY m.first_name ASC
+        """, (receipt_id,))
+        return await cursor.fetchall()
+
+
 async def add_item(receipt_id: int, name: str, price: float):
     async with aiosqlite.connect(DB_NAME) as db:
 
@@ -204,15 +254,21 @@ async def add_item(receipt_id: int, name: str, price: float):
         await db.commit()
 
 
-async def update_receipt_total(receipt_id:int,total:float,store:str):
+async def update_receipt_total(
+    receipt_id: int,
+    total: float,
+    store: str,
+    category: str | None = None
+):
     async with aiosqlite.connect(DB_NAME) as db:
-
-        await db.execute("""
-        UPDATE receipts
-        SET total=?, store=?, processed=1
-        WHERE id=?
-        """,(total,store,receipt_id))
-
+        await db.execute(
+            """
+            UPDATE receipts
+            SET total=?, store=?, category=?, processed=1
+            WHERE id=?
+            """,
+            (total, store, category, receipt_id)
+        )
         await db.commit()
 
 async def add_debt(

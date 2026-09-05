@@ -53,12 +53,15 @@ from database import (
     clear_debts,
     clear_members,
     get_my_receipts,
+    get_receipt_items,
+    get_receipt_participants,
+    set_receipt_payer,
 )
 
 
 
 load_dotenv()
-
+ 
 TOKEN = os.getenv("BOT_TOKEN")
 
 if not TOKEN:
@@ -75,6 +78,12 @@ dp = Dispatcher()
 class ReceiptState(StatesGroup):
     choosing_members = State()
     waiting_confirmation = State()
+    manual_amount = State()
+    manual_category = State()
+    manual_category_custom = State()
+    manual_payer = State()
+    manual_participants = State()
+    manual_confirmation = State()
 
 
 # =========================================================
@@ -103,6 +112,9 @@ def main_keyboard():
             ],
             [
                 KeyboardButton(text="📸 Загрузить чек"),
+                KeyboardButton(text="✍️ Добавить покупку"),
+            ],
+            [
                 KeyboardButton(text="🧾 Мои чеки"),
             ],
             [
@@ -252,6 +264,299 @@ async def members(message: Message):
 @dp.message(lambda message: message.text == "👥 Участники")
 async def members_button(message: Message):
     await members(message)
+
+
+# =========================================================
+# РУЧНОЕ ДОБАВЛЕНИЕ ПОКУПКИ (F2)
+# =========================================================
+
+MANUAL_CATEGORIES = [
+    "Продукты",
+    "Коммуналка",
+    "Транспорт",
+    "Развлечения",
+    "Прочее",
+    "✏️ Своя категория",
+]
+
+
+@dp.message(lambda message: message.text == "✍️ Добавить покупку")
+async def manual_purchase_start(message: Message, state: FSMContext):
+    if message.chat.type == "private":
+        await message.answer("❌ Ручную покупку нужно добавлять в группе.")
+        return
+
+    members = await get_members(message.chat.id)
+    if not members:
+        await message.answer(
+            "❌ В группе пока нет участников.\n\n"
+            "Сначала нажмите «➕ Присоединиться»."
+        )
+        return
+
+    await state.clear()
+    await state.set_state(ReceiptState.manual_amount)
+    await message.answer(
+        "✍️ <b>Добавление покупки вручную</b>\n\n"
+        "Введите сумму покупки в рублях.\n"
+        "Например: <code>1250.50</code> или <code>1250,50</code>",
+        parse_mode="HTML"
+    )
+
+
+@dp.message(ReceiptState.manual_amount)
+async def manual_amount(message: Message, state: FSMContext):
+    text = (message.text or "").strip().replace(",", ".").replace(" ", "")
+    try:
+        amount = float(text)
+    except ValueError:
+        await message.answer("❌ Не понял сумму. Введите число, например <code>850.50</code>.", parse_mode="HTML")
+        return
+
+    if amount <= 0:
+        await message.answer("❌ Сумма должна быть больше нуля.")
+        return
+
+    if amount > 10_000_000:
+        await message.answer("❌ Сумма слишком большая. Проверьте ввод.")
+        return
+
+    await state.update_data(manual_amount=round(amount, 2))
+    builder = InlineKeyboardBuilder()
+    for category in MANUAL_CATEGORIES:
+        builder.button(text=category, callback_data=f"manual_cat:{category}")
+    builder.adjust(2)
+
+    await state.set_state(ReceiptState.manual_category)
+    await message.answer(
+        "🏷 Выберите категорию покупки:",
+        reply_markup=builder.as_markup()
+    )
+
+
+@dp.callback_query(ReceiptState.manual_category, lambda c: c.data.startswith("manual_cat:"))
+async def manual_category(callback: CallbackQuery, state: FSMContext):
+    category = callback.data.split(":", 1)[1]
+
+    if category == "✏️ Своя категория":
+        await state.set_state(ReceiptState.manual_category_custom)
+        await callback.message.edit_text(
+            "✏️ Введите свою категорию одним сообщением.\n"
+            "Например: «Дом», «Аптека» или «Питомцы»."
+        )
+        await callback.answer()
+        return
+
+    await state.update_data(manual_category=category)
+    await show_manual_payer(callback.message, state)
+    await callback.answer()
+
+
+@dp.message(ReceiptState.manual_category_custom)
+async def manual_custom_category(message: Message, state: FSMContext):
+    category = (message.text or "").strip()
+    if not category or len(category) > 50:
+        await message.answer("❌ Категория должна содержать от 1 до 50 символов.")
+        return
+
+    await state.update_data(manual_category=category)
+    await show_manual_payer(message, state)
+
+
+async def show_manual_payer(message: Message, state: FSMContext):
+    members = await get_members(message.chat.id)
+    builder = InlineKeyboardBuilder()
+
+    for user_id, username, first_name in members:
+        name = first_name or (f"@{username}" if username else str(user_id))
+        builder.button(text=f"💳 {name}", callback_data=f"manual_payer:{user_id}")
+    builder.adjust(1)
+
+    await state.set_state(ReceiptState.manual_payer)
+    await message.answer(
+        "💳 Кто оплатил покупку?",
+        reply_markup=builder.as_markup()
+    )
+
+
+@dp.callback_query(ReceiptState.manual_payer, lambda c: c.data.startswith("manual_payer:"))
+async def manual_payer(callback: CallbackQuery, state: FSMContext):
+    payer_id = int(callback.data.split(":", 1)[1])
+    await state.update_data(manual_payer=payer_id, manual_selected=[])
+
+    await show_manual_participants(callback.message, state)
+    await callback.answer()
+
+
+async def show_manual_participants(message: Message, state: FSMContext):
+    data = await state.get_data()
+    selected = set(data.get("manual_selected", []))
+    members = await get_members(message.chat.id)
+
+    builder = InlineKeyboardBuilder()
+    for user_id, username, first_name in members:
+        mark = "✅" if user_id in selected else "⬜"
+        name = first_name or (f"@{username}" if username else str(user_id))
+        builder.button(
+            text=f"{mark} {name}",
+            callback_data=f"manual_member:{user_id}"
+        )
+
+    builder.button(text="✅ Готово", callback_data="manual_members_done")
+    builder.adjust(2)
+
+    await state.set_state(ReceiptState.manual_participants)
+    await message.answer(
+        "👥 Кто участвует в покупке?\n\n"
+        "Выберите одного или нескольких участников. "
+        "Оплачивающий тоже может быть выбран.",
+        reply_markup=builder.as_markup()
+    )
+
+
+@dp.callback_query(ReceiptState.manual_participants, lambda c: c.data.startswith("manual_member:"))
+async def manual_toggle_participant(callback: CallbackQuery, state: FSMContext):
+    uid = int(callback.data.split(":", 1)[1])
+    data = await state.get_data()
+    selected = set(data.get("manual_selected", []))
+
+    if uid in selected:
+        selected.remove(uid)
+    else:
+        selected.add(uid)
+
+    await state.update_data(manual_selected=list(selected))
+    await callback.message.edit_reply_markup(
+        reply_markup=await manual_participants_markup(callback.message.chat.id, selected)
+    )
+    await callback.answer()
+
+
+async def manual_participants_markup(chat_id: int, selected):
+    members = await get_members(chat_id)
+    builder = InlineKeyboardBuilder()
+
+    for user_id, username, first_name in members:
+        mark = "✅" if user_id in selected else "⬜"
+        name = first_name or (f"@{username}" if username else str(user_id))
+        builder.button(
+            text=f"{mark} {name}",
+            callback_data=f"manual_member:{user_id}"
+        )
+
+    builder.button(text="✅ Готово", callback_data="manual_members_done")
+    builder.adjust(2)
+    return builder.as_markup()
+
+
+@dp.callback_query(ReceiptState.manual_participants, lambda c: c.data == "manual_members_done")
+async def manual_members_done(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    selected = data.get("manual_selected", [])
+
+    if not selected:
+        await callback.answer("Выберите хотя бы одного участника.", show_alert=True)
+        return
+
+    amount = float(data["manual_amount"])
+    category = data["manual_category"]
+    payer = int(data["manual_payer"])
+    share = round(amount / len(selected), 2)
+
+    members = await get_members(callback.message.chat.id)
+    names = {
+        uid: (first_name or (f"@{username}" if username else str(uid)))
+        for uid, username, first_name in members
+    }
+
+    selected_names = ", ".join(names.get(uid, str(uid)) for uid in selected)
+    payer_name = names.get(payer, "Неизвестный")
+
+    await state.set_state(ReceiptState.manual_confirmation)
+    await callback.message.edit_text(
+        "✍️ <b>Проверьте покупку</b>\n\n"
+        f"💰 Сумма: {amount:.2f} ₽\n"
+        f"🏷 Категория: {category}\n"
+        f"💳 Оплатил: {payer_name}\n"
+        f"👥 Участники: {selected_names}\n"
+        f"💸 Доля каждого: {share:.2f} ₽\n\n"
+        "Если всё верно — подтвердите.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Подтвердить", callback_data="manual_confirm"),
+                InlineKeyboardButton(text="❌ Отменить", callback_data="manual_cancel"),
+            ]
+        ]),
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(ReceiptState.manual_confirmation, lambda c: c.data == "manual_confirm")
+async def manual_confirm(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    chat_id = callback.message.chat.id
+    amount = float(data["manual_amount"])
+    category = data["manual_category"]
+    payer = int(data["manual_payer"])
+    selected = data["manual_selected"]
+
+    await add_group(chat_id, callback.message.chat.title or "")
+    await add_receipt(
+        chat_id=chat_id,
+        user_id=callback.from_user.id,
+        file_id=None,
+        image_path=None
+    )
+    receipt = await get_last_receipt(chat_id)
+    receipt_id = receipt[0]
+
+    for uid in selected:
+        await link_member_to_receipt(receipt_id, uid)
+
+    await set_receipt_payer(receipt_id, payer)
+    await update_receipt_total(receipt_id, amount, "Ручной ввод", category)
+
+    members = await get_members(chat_id)
+    payer_name = next(
+        (
+            first_name or (f"@{username}" if username else str(uid))
+            for uid, username, first_name in members
+            if uid == payer
+        ),
+        "Неизвестный"
+    )
+
+    share = round(amount / len(selected), 2)
+    for uid in selected:
+        if uid == payer:
+            continue
+        await add_debt(
+            chat_id=chat_id,
+            from_user=uid,
+            to_user=payer,
+            receipt_id=receipt_id,
+            amount=share
+        )
+
+    await callback.message.edit_text(
+        "✅ <b>Покупка добавлена!</b>\n\n"
+        f"💰 {amount:.2f} ₽\n"
+        f"🏷 {category}\n"
+        f"💳 Оплатил: {payer_name}\n"
+        f"👥 Участников: {len(selected)}\n"
+        f"💸 Доля: {share:.2f} ₽",
+        parse_mode="HTML"
+    )
+    await state.clear()
+    await callback.answer("Покупка сохранена!")
+
+
+@dp.callback_query(ReceiptState.manual_confirmation, lambda c: c.data == "manual_cancel")
+async def manual_cancel(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("❌ Добавление покупки отменено.\n\nДолги не созданы.")
+    await state.clear()
+    await callback.answer("Отменено")
 
 
 # =========================================================
@@ -658,6 +963,9 @@ async def confirm_receipt(
             price
         )
 
+    # Запоминаем пользователя, который подтвердил оплату чека.
+    await set_receipt_payer(receipt_id, payer)
+
     await update_receipt_total(
         receipt_id,
         total,
@@ -771,32 +1079,167 @@ async def cancel_clear_members(
 # /receipts
 # =========================================================
 
+def receipts_list_kb(data):
+    builder = InlineKeyboardBuilder()
+    for receipt_id, _, created_at, *_ in data:
+        builder.button(
+            text=f"🧾 {created_at}",
+            callback_data=f"receipt:{receipt_id}",
+        )
+    builder.adjust(1)
+    return builder.as_markup()
+
+
 @dp.message(Command("receipts"))
 async def receipts(message: Message):
-    data = await get_receipts(
-        message.chat.id
-    )
+    data = await get_receipts(message.chat.id)
 
     if not data:
-        await message.answer(
-            "Пока нет сохранённых чеков."
-        )
+        await message.answer("Пока нет сохранённых чеков.")
         return
 
-    text = "🧾 Последние чеки:\n\n"
+    members = await get_members(message.chat.id)
+    names = {
+        uid: (first_name or (f"@{username}" if username else str(uid)))
+        for uid, username, first_name in members
+    }
 
-    for i, (_, date) in enumerate(
-        data,
-        start=1
-    ):
-        text += f"{i}. {date}\n"
+    builder = InlineKeyboardBuilder()
 
-    await message.answer(text)
+    for receipt in data:
+        (
+            receipt_id,
+            _,
+            created_at,
+            user_id,
+            username,
+            first_name,
+            store,
+            total,
+            payer_id,
+        ) = receipt
+
+        buyer_name = names.get(
+            payer_id,
+            first_name or (f"@{username}" if username else str(user_id))
+        )
+
+        builder.button(
+            text=f"🧾 {created_at} — 👤 {buyer_name}",
+            callback_data=f"receipt:{receipt_id}",
+        )
+
+    builder.adjust(1)
+
+    await message.answer(
+        "🧾 Все чеки:\n\n"
+        "Нажмите на чек, чтобы открыть полную информацию:",
+        reply_markup=builder.as_markup(),
+    )
+
 
 @dp.message(lambda message: message.text == "🧾 Все чеки")
 async def all_receipts_button(message: Message):
     await receipts(message)
 
+
+@dp.callback_query(lambda c: c.data.startswith("receipt:"))
+async def receipt_details(callback: CallbackQuery):
+    receipt_id = int(callback.data.split(":", 1)[1])
+
+    data = await get_receipts(callback.message.chat.id)
+    receipt = next((r for r in data if r[0] == receipt_id), None)
+
+    if not receipt:
+        await callback.answer("Чек не найден.", show_alert=True)
+        return
+
+    (
+        _,
+        image_path,
+        created_at,
+        user_id,
+        username,
+        first_name,
+        store,
+        total,
+        payer_id,
+    ) = receipt
+
+    members = await get_members(callback.message.chat.id)
+    names = {
+        uid: (first_name or (f"@{username}" if username else str(uid)))
+        for uid, username, first_name in members
+    }
+
+    buyer_name = names.get(
+        payer_id,
+        first_name or (f"@{username}" if username else str(user_id))
+    )
+
+    items = await get_receipt_items(receipt_id)
+    participants = await get_receipt_participants(receipt_id)
+
+    lines = [
+        f"🧾 Чек #{receipt_id}",
+        f"📅 Дата: {created_at}",
+        f"👤 Кто купил: {buyer_name}",
+    ]
+
+    if store:
+        lines.append(f"🏪 Магазин: {store}")
+
+    total_value = float(total or 0)
+    lines.append(f"💰 Итого: {total_value:.2f} ₽")
+
+    lines.append("")
+    lines.append("🛒 Товары:")
+
+    if items:
+        for name, price in items:
+            lines.append(f"• {name} — {float(price):.2f} ₽")
+    else:
+        lines.append("• Нет распознанных товаров.")
+
+    lines.append("")
+    lines.append("💸 Кто сколько должен:")
+
+    if participants and total_value > 0:
+        base_share = round(total_value / len(participants), 2)
+        running = 0.0
+
+        for index, (uid, username, participant_first_name) in enumerate(participants):
+            name = participant_first_name or (
+                f"@{username}" if username else str(uid)
+            )
+
+            # Последнему участнику отдаём остаток от округления.
+            if index == len(participants) - 1:
+                amount = round(total_value - running, 2)
+            else:
+                amount = base_share
+
+            running += amount
+
+            if payer_id and uid == payer_id:
+                lines.append(f"• {name} — 0 ₽ (оплатил чек)")
+            else:
+                lines.append(f"• {name} — {amount:.2f} ₽")
+
+    elif participants:
+        for uid, username, participant_first_name in participants:
+            name = participant_first_name or (
+                f"@{username}" if username else str(uid)
+            )
+            lines.append(f"• {name} — сумма не определена")
+    else:
+        lines.append("• Участники не указаны.")
+
+    # Фото чека при просмотре списка чеков не читаем и не отправляем.
+    # Показываем только сохранённые данные: товары, цены и расчёт долгов.
+    await callback.message.answer("\n".join(lines))
+
+    await callback.answer()
 
 # =========================================================
 # КНОПКА "МОИ ЧЕКИ"
@@ -822,12 +1265,21 @@ async def my_receipts_button(message: Message):
         )
         return
 
-    text = "🧾 Ваши последние чеки:\n\n"
+    builder = InlineKeyboardBuilder()
 
-    for i, (_, date) in enumerate(data, start=1):
-        text += f"{i}. {date}\n"
+    for receipt_id, date in data:
+        builder.button(
+            text=f"🧾 {date}",
+            callback_data=f"receipt:{receipt_id}",
+        )
 
-    await message.answer(text)
+    builder.adjust(1)
+
+    await message.answer(
+        "🧾 Ваши последние чеки:\n\n"
+        "Нажмите на чек, чтобы открыть товары, цены и расчёт долгов:",
+        reply_markup=builder.as_markup(),
+    )
 
 
 # =========================================================
