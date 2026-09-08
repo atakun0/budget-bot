@@ -1,4 +1,10 @@
-aiogram
-aiosqlite
-python-dotenv
-requests
+aiogram==3.31.0
+aiosqlite==0.22.1
+dotenv==0.9.9
+fonttools==4.64.0
+matplotlib==3.11.1
+pigar==2.2.0
+pillow==12.3.0
+pipreqs==0.4.13
+python-dotenv==1.2.3
+requests==2.34.2
